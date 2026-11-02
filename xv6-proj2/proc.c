@@ -23,6 +23,8 @@ static struct proc *ready_head = 0;
 static void enqueue_ready(struct proc *p);
 static struct proc *dequeue_ready(void);
 static void remove_ready(struct proc *p);
+static int higher_priority(struct proc *a, struct proc *b);
+static struct proc *best_process(struct proc *running);
 
 static void
 enqueue_ready(struct proc *p)
@@ -66,6 +68,30 @@ remove_ready(struct proc *p)
      }
       cur = &(*cur)->next_ready;
     }
+}
+
+static int
+higher_priority(struct proc *a, struct proc *b)
+{
+  if(a == 0)
+    return 0;
+  
+  if(b == 0)
+    return 1;
+
+  if(a->priority != b->priority)
+    return a->priority < b->priority;
+
+  return a->pid > b->pid;
+}
+
+static struct proc*
+best_process(struct proc *running)
+{
+  if(higher_priority(ready_head, running))
+    return ready_head;
+
+  return running;
 }
 
 void
@@ -234,7 +260,7 @@ fork(void)
   int i, pid;
   struct proc *np;
   struct proc *curproc = myproc();
-
+  int need_resched;
   // Allocate process.
   if((np = allocproc()) == 0){
     return -1;
@@ -272,7 +298,12 @@ fork(void)
   np->state = RUNNABLE;
   enqueue_ready(np);
 
+  need_resched = higher_priority(np, curproc);
+
   release(&ptable.lock);
+
+  if(need_resched)
+    yield();
 
   return pid;
 }
@@ -602,7 +633,14 @@ setnice(int pid, int nice)
     return -1;
 
   struct proc *p;
+  struct proc *curproc = myproc();
+  struct proc *before;
+  struct proc *after;
+  int need_resched = 0;
+
   acquire(&ptable.lock);
+  before = best_process(curproc);
+
   for( p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->pid == pid){
       if(p->state == RUNNABLE)
@@ -613,7 +651,17 @@ setnice(int pid, int nice)
     if(p->state == RUNNABLE)
       enqueue_ready(p);
 
+    after = best_process(curproc);
+
+    if(before != after && after != curproc)
+      need_resched = 1;
+
+
     release(&ptable.lock);
+   
+    if(need_resched)
+      yield();
+
     return 0;
     }
 
