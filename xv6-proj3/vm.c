@@ -7,6 +7,9 @@
 #include "proc.h"
 #include "elf.h"
 
+// Software bit recording write permission removed for copy-on-write.
+#define PTE_COW 0x200
+
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
 
@@ -310,15 +313,13 @@ clearpteu(pde_t *pgdir, char *uva)
   *pte &= ~PTE_U;
 }
 
-// Given a parent process's page table, create a copy
-// of it for a child.
+// Give the child independent page tables sharing the parent's physical pages.
 pde_t*
 copyuvm(pde_t *pgdir, uint sz)
 {
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
@@ -329,17 +330,26 @@ copyuvm(pde_t *pgdir, uint sz)
       panic("copyuvm: page not present");
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    if((flags & (PTE_U|PTE_W)) == (PTE_U|PTE_W))
+      flags |= PTE_COW;
+    flags &= ~PTE_W;
+    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
       goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
-    }
+    inc_refcount(pa);
   }
+
+  // Commit parent permissions only after all child mappings succeed.
+  for(i = 0; i < sz; i += PGSIZE){
+    pte = walkpgdir(pgdir, (void*)i, 0);
+    if((*pte & (PTE_U|PTE_W)) == (PTE_U|PTE_W))
+      *pte |= PTE_COW;
+    *pte &= ~PTE_W;
+  }
+  lcr3(V2P(pgdir));
   return d;
 
 bad:
+  // freevm() drops exactly the references owned by installed child mappings.
   freevm(d);
   return 0;
 }
