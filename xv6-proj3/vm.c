@@ -11,6 +11,7 @@
 #define PTE_COW 0x200
 
 extern char data[];  // defined by kernel.ld
+extern char end[];
 pde_t *kpgdir;  // for use in scheduler()
 
 // Set up CPU's kernel segment descriptors.
@@ -395,16 +396,46 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
-void
-page_fault(void)
+// Resolve a CoW write fault, or return -1 for the normal trap error path.
+int
+page_fault(uint err)
 {
+  struct proc *p;
   uint va = rcr2();
-  if(va < 0) {
-    panic("Invalid access");
-    return;
+  uint pa, flags, count;
+  pte_t *pte;
+  char *mem;
+
+  p = myproc();
+  // Require a write to a present page, with no reserved-bit violation.
+  if((err & 0xb) != 0x3 || p == 0 || p->pgdir == 0 ||
+     va >= p->sz || va >= KERNBASE)
+    return -1;
+  pte = walkpgdir(p->pgdir, (void*)PGROUNDDOWN(va), 0);
+  if(pte == 0 ||
+     (*pte & (PTE_P|PTE_U|PTE_W|PTE_COW)) != (PTE_P|PTE_U|PTE_COW))
+    return -1;
+  pa = PTE_ADDR(*pte);
+  if(pa < V2P(end) || pa >= PHYSTOP)
+    return -1;
+  count = get_refcount(pa);
+  if(count == 0)
+    return -1;
+
+  flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+  if(count == 1){
+    *pte = pa | flags;
+    lcr3(V2P(p->pgdir));
+    return 0;
   }
-  
-  return;
+
+  if((mem = kalloc()) == 0)
+    return -1;
+  memmove(mem, P2V(pa), PGSIZE);
+  *pte = V2P(mem) | flags;
+  lcr3(V2P(p->pgdir));
+  dec_refcount(pa);
+  return 0;
 }
 
 //PAGEBREAK!

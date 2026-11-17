@@ -48,8 +48,9 @@ trap(struct trapframe *tf)
 
   switch(tf->trapno){
   case T_PGFLT:
-    page_fault();
-    break;
+    if(page_fault(tf->err) == 0)
+      break;
+    goto unexpected;
   case T_IRQ0 + IRQ_TIMER:
     if(cpuid() == 0){
       acquire(&tickslock);
@@ -83,6 +84,7 @@ trap(struct trapframe *tf)
 
   //PAGEBREAK: 13
   default:
+  unexpected:
     if(myproc() == 0 || (tf->cs&3) == 0){
       // In kernel, it must be our mistake.
       cprintf("unexpected trap %d from cpu %d eip %x (cr2=0x%x)\n",
