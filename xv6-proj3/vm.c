@@ -396,24 +396,18 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
-// Resolve a CoW write fault, or return -1 for the normal trap error path.
-int
-page_fault(uint err)
+// Prepare a user page before either a fault retry or a kernel write.
+static int
+cow_write_page(pde_t *pgdir, pte_t *pte)
 {
-  struct proc *p;
-  uint va = rcr2();
   uint pa, flags, count;
-  pte_t *pte;
   char *mem;
 
-  p = myproc();
-  // Require a write to a present page, with no reserved-bit violation.
-  if((err & 0xb) != 0x3 || p == 0 || p->pgdir == 0 ||
-     va >= p->sz || va >= KERNBASE)
+  if(pte == 0 || (*pte & (PTE_P|PTE_U)) != (PTE_P|PTE_U))
     return -1;
-  pte = walkpgdir(p->pgdir, (void*)PGROUNDDOWN(va), 0);
-  if(pte == 0 ||
-     (*pte & (PTE_P|PTE_U|PTE_W|PTE_COW)) != (PTE_P|PTE_U|PTE_COW))
+  if(*pte & PTE_W)
+    return 0;
+  if(!(*pte & PTE_COW))
     return -1;
   pa = PTE_ADDR(*pte);
   if(pa < V2P(end) || pa >= PHYSTOP)
@@ -425,7 +419,7 @@ page_fault(uint err)
   flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
   if(count == 1){
     *pte = pa | flags;
-    lcr3(V2P(p->pgdir));
+    lcr3(V2P(pgdir));
     return 0;
   }
 
@@ -433,9 +427,48 @@ page_fault(uint err)
     return -1;
   memmove(mem, P2V(pa), PGSIZE);
   *pte = V2P(mem) | flags;
-  lcr3(V2P(p->pgdir));
+  lcr3(V2P(pgdir));
   dec_refcount(pa);
   return 0;
+}
+
+// Resolve CoW before an output syscall takes locks or allocates resources.
+int
+prepare_user_write(uint va, uint len)
+{
+  struct proc *p = myproc();
+  uint a, last;
+
+  if(p == 0 || p->pgdir == 0 || va >= p->sz || va >= KERNBASE ||
+     len > p->sz - va || len > KERNBASE - va)
+    return -1;
+  if(len == 0)
+    return 0;
+  last = PGROUNDDOWN(va + len - 1);
+  for(a = PGROUNDDOWN(va); a <= last; a += PGSIZE){
+    if(cow_write_page(p->pgdir, walkpgdir(p->pgdir, (void*)a, 0)) < 0)
+      return -1;
+  }
+  return 0;
+}
+
+// Resolve a CoW write fault, or return -1 for the normal trap error path.
+int
+page_fault(uint err)
+{
+  struct proc *p = myproc();
+  uint va = rcr2();
+  pte_t *pte;
+
+  // Require a write to a present page, with no reserved-bit violation.
+  if((err & 0xb) != 0x3 || p == 0 || p->pgdir == 0 ||
+     va >= p->sz || va >= KERNBASE)
+    return -1;
+  pte = walkpgdir(p->pgdir, (void*)PGROUNDDOWN(va), 0);
+  if(pte == 0 ||
+     (*pte & (PTE_P|PTE_U|PTE_W|PTE_COW)) != (PTE_P|PTE_U|PTE_COW))
+    return -1;
+  return cow_write_page(p->pgdir, pte);
 }
 
 //PAGEBREAK!
